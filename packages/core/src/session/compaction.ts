@@ -7,6 +7,7 @@ import type { EventV2 } from "../event"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
+import { SessionAccounting } from "./accounting"
 import { Token } from "../util/token"
 
 const DEFAULT_BUFFER = 20_000
@@ -67,6 +68,7 @@ type Settings = {
 
 type Dependencies = {
   readonly events: EventV2.Interface
+  readonly accounting: ReturnType<typeof SessionAccounting.make>
   readonly llm: {
     readonly stream: (request: LLMRequest) => Stream.Stream<LLMEvent, LLMError>
   }
@@ -209,7 +211,8 @@ export const make = (dependencies: Dependencies) => {
 
     const chunks: string[] = []
     let failed = false
-    const summarized = yield* dependencies.llm
+    const capture = SessionAccounting.capture()
+    const request = dependencies.llm
       .stream(
         LLM.request({
           model: input.model,
@@ -221,6 +224,7 @@ export const make = (dependencies: Dependencies) => {
       )
       .pipe(
         Stream.runForEach((event) => {
+          capture.capture(event)
           if (LLMEvent.is.providerError(event)) failed = true
           if (LLMEvent.is.textDelta(event)) chunks.push(event.text)
           return Effect.void
@@ -230,6 +234,23 @@ export const make = (dependencies: Dependencies) => {
           Effect.logWarning("Session compaction request failed", error).pipe(Effect.as(false)),
         ),
       )
+    const summarized = yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const exit = yield* restore(request).pipe(Effect.exit)
+        const measurement = capture.value()
+        if (measurement?.usage !== undefined || measurement?.responseModelID !== undefined) {
+          yield* dependencies.accounting.record({
+            sessionID: input.sessionID,
+            requestID: messageID,
+            operation: "compaction",
+            model: input.model,
+            ...measurement,
+          })
+        }
+        if (exit._tag === "Failure") return yield* Effect.failCause(exit.cause)
+        return exit.value
+      }),
+    )
     const summary = chunks.join("")
     if (!summarized || failed || !summary.trim()) return "failed" as const
     yield* dependencies.events.publish(SessionEvent.Compaction.Ended, {

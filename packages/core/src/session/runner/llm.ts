@@ -13,6 +13,7 @@ import { Cause, DateTime, Effect, FiberSet, Layer, Option, Semaphore, Stream } f
 import { eq } from "drizzle-orm"
 import { AgentV2 } from "../../agent"
 import { Config } from "../../config"
+import { Catalog } from "../../catalog"
 import { Database } from "../../database/database"
 import { EventV2 } from "../../event"
 import { Location } from "../../location"
@@ -30,6 +31,7 @@ import { ProjectTools } from "../../tool/project"
 import { ToolOutputStore } from "../../tool-output-store"
 import { SessionContextEpoch } from "../context-epoch"
 import { SessionCompaction } from "../compaction"
+import { SessionAccounting } from "../accounting"
 import { SessionEvent } from "../event"
 import { ProviderTurnInterruptedMessage, ProviderTurnInterruptedOrigin } from "../error"
 import { SessionHistory } from "../history"
@@ -114,6 +116,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2.Service
+    const catalog = yield* Catalog.Service
     const llm = yield* LLMClient.Service
     const agents = yield* AgentV2.Service
     const tools = yield* ToolRegistry.Service
@@ -128,7 +131,9 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     const snapshots = yield* Snapshot.Service
     const db = (yield* Database.Service).db
-    const compaction = SessionCompaction.make({ events, llm, config: yield* config.entries() })
+    const configEntries = yield* config.entries()
+    const accounting = SessionAccounting.make({ events, catalog, config: configEntries })
+    const compaction = SessionCompaction.make({ events, llm, accounting, config: configEntries })
     const auxiliaryAgent = (id: string) => agents.get(AgentV2.ID.make(id))
     const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
       const session = yield* store.get(sessionID)
@@ -210,46 +215,86 @@ const layer = Layer.effect(
         if (session.parentID || !isDefaultTitle(session.title)) return
         const users = context.filter((message) => message.type === "user")
         if (users.length !== 1) return
-        const agent = yield* auxiliaryAgent("title")
-        if (!agent) return
-        const model = yield* models.auxiliary({
-          session,
-          agent,
-          originAgent,
-          primary: Effect.succeed(primary),
-          infer: true,
-        })
-        const text = yield* llm
-          .stream(
-            LLM.request({
-              model,
-              http: sessionHttp(session),
-              system: agent.system ? [SystemPart.make(agent.system)] : [],
-              messages: [Message.user("Generate a title for this conversation:\n"), ...toLLMMessages(users, model)],
-              tools: [],
-            }),
-          )
-          .pipe(
-            Stream.filter(LLMEvent.is.textDelta),
-            Stream.map((event) => event.text),
-            Stream.mkString,
-          )
+        const requestID = SessionMessage.ID.create()
+        const capture = SessionAccounting.capture()
+        let requestedModel: Model | undefined
+        const chunks: string[] = []
+        const result = yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const attempted = yield* restore(
+              Effect.gen(function* () {
+                const agent = yield* auxiliaryAgent("title")
+                if (!agent) return
+                requestedModel = yield* models.auxiliary({
+                  session,
+                  agent,
+                  originAgent,
+                  primary: Effect.succeed(primary),
+                  infer: true,
+                })
+                const model = requestedModel
+                yield* llm
+                  .stream(
+                    LLM.request({
+                      model,
+                      http: sessionHttp(session),
+                      system: agent.system ? [SystemPart.make(agent.system)] : [],
+                      messages: [
+                        Message.user("Generate a title for this conversation:\n"),
+                        ...toLLMMessages(users, model),
+                      ],
+                      tools: [],
+                    }),
+                  )
+                  .pipe(
+                    Stream.runForEach((event) => {
+                      capture.capture(event)
+                      if (LLMEvent.is.textDelta(event)) chunks.push(event.text)
+                      return Effect.void
+                    }),
+                  )
+                return true
+              }),
+            ).pipe(Effect.exit)
+            const measurement = capture.value()
+            if (requestedModel && (measurement?.usage !== undefined || measurement?.responseModelID !== undefined)) {
+              yield* accounting.record({
+                sessionID: session.id,
+                requestID,
+                operation: "title",
+                model: requestedModel,
+                ...measurement,
+              })
+            }
+            if (attempted._tag === "Failure") {
+              if (Cause.hasInterruptsOnly(attempted.cause)) return yield* Effect.failCause(attempted.cause)
+              yield* Effect.logWarning("Failed to title Session", attempted.cause)
+              return
+            }
+            if (!attempted.value) return
+            return chunks.join("")
+          }),
+        )
+        if (result === undefined) return
+        const text = result
         const cleaned = text
           .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
           .split("\n")
           .map((line) => line.trim())
           .find((line) => line.length > 0)
         if (!cleaned) return
-        yield* events.publish(SessionEvent.Titled, {
-          sessionID: session.id,
-          timestamp: yield* DateTime.now,
-          title: cleaned.length > 100 ? cleaned.substring(0, 97) + "..." : cleaned,
-        })
+        yield* events
+          .publish(SessionEvent.Titled, {
+            sessionID: session.id,
+            timestamp: yield* DateTime.now,
+            title: cleaned.length > 100 ? cleaned.substring(0, 97) + "..." : cleaned,
+          })
+          .pipe(
+            Effect.catchCause((cause) =>
+              Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) : Effect.logWarning("Failed to title Session", cause),
+            ),
+          )
       },
-      // A title is best effort: its failure never fails the drain.
-      Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) : Effect.logWarning("Failed to title Session", cause),
-      ),
       Effect.orDie,
     )
 
@@ -390,6 +435,18 @@ const layer = Layer.effect(
       return yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const stream = yield* restore(providerStream).pipe(Effect.exit)
+          const captured = publisher.accounting()
+          const measurement =
+            captured === undefined
+              ? undefined
+              : yield* accounting.record({
+                  sessionID: session.id,
+                  requestID: publisher.requestID(),
+                  operation: "turn",
+                  model,
+                  assistantMessageID: publisher.requestID(),
+                  ...captured,
+                })
           const failure =
             stream._tag === "Failure" ? Option.getOrUndefined(Cause.findErrorOption(stream.cause)) : undefined
           if (
@@ -418,7 +475,7 @@ const layer = Layer.effect(
           ) {
             yield* FiberSet.clear(toolFibers)
             yield* withPublication(publisher.failUnsettledTools("Tool execution interrupted"))
-            if (publisher.hasAssistantStarted())
+            if (publisher.hasAssistantStarted() || publisher.stepSettlement())
               yield* withPublication(
                 publisher.failAssistant({
                   type: "unknown",
@@ -447,8 +504,8 @@ const layer = Layer.effect(
                 timestamp: yield* DateTime.now,
                 assistantMessageID: yield* publisher.startAssistant(),
                 finish: stepSettlement.finish,
-                cost: 0,
-                tokens: stepSettlement.tokens,
+                cost: measurement?.cost ?? 0,
+                tokens: measurement?.tokens ?? stepSettlement.tokens,
                 snapshot: endSnapshot,
                 files,
               }),
@@ -570,6 +627,7 @@ export const node = makeLocationNode({
   layer,
   deps: [
     EventV2.node,
+    Catalog.node,
     llmClient,
     AgentV2.node,
     ToolRegistry.node,

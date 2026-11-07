@@ -5,6 +5,7 @@ import { ModelV2 } from "../../model"
 import { SessionEvent } from "../event"
 import { SessionMessage } from "../message"
 import { SessionSchema } from "../schema"
+import { SessionAccounting } from "../accounting"
 
 type Input = {
   readonly sessionID: SessionSchema.ID
@@ -52,6 +53,8 @@ const settledOutput = (value: ToolOutput | undefined, result: ToolResultValue): 
 
 /** Persist one provider turn without executing tools or starting a continuation turn. */
 export const createLLMEventPublisher = (events: EventV2.Interface, input: Input) => {
+  const requestID = SessionMessage.ID.create()
+  const accounting = SessionAccounting.capture()
   const tools = new Map<
     string,
     {
@@ -73,7 +76,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
 
   const startAssistant = Effect.fnUntraced(function* () {
     if (assistantMessageID !== undefined) return assistantMessageID
-    assistantMessageID = SessionMessage.ID.create()
+    assistantMessageID = requestID
     assistantActive = true
     yield* events.publish(SessionEvent.Step.Started, {
       ...input,
@@ -398,9 +401,11 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
         yield* flush()
         assistantActive = false
         if (stepSettlement) return yield* Effect.die("Duplicate step finish")
+        accounting.capture(event)
         stepSettlement = { finish: event.reason, tokens: tokens(event.usage) }
         return
       case "finish":
+        accounting.capture(event)
         return
       case "provider-error":
         providerFailed = true
@@ -418,6 +423,8 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     hasAssistantStarted: () => assistantMessageID !== undefined,
     hasProviderError: () => providerFailed,
     stepSettlement: () => stepSettlement,
+    accounting: accounting.value,
+    requestID: () => requestID,
     startAssistant,
     assistantMessageID: assistantMessageIDForTool,
   }

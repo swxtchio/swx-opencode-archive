@@ -5,6 +5,7 @@ import { DateTime, Effect, Layer, Schema } from "effect"
 import { Database } from "../database/database"
 import { EventV2 } from "../event"
 import { makeGlobalNode } from "../effect/app-node"
+import { SessionAccountingEvent } from "@opencode-ai/schema/session-accounting-event"
 import { SessionEvent } from "./event"
 import { SessionV1 } from "../v1/session"
 import { WorkspaceTable } from "../control-plane/workspace.sql"
@@ -238,7 +239,7 @@ const layer = Layer.effectDiscard(
     // inside the commit transaction leaves no event, sequence or notification. Registered first so it runs before the
     // domain projectors; creation makes the row and deletion is followed by the aggregate's removal.
     yield* Effect.forEach(
-      [...SessionV1.Event.Definitions, ...SessionEvent.DurableDefinitions].filter(
+      [...SessionV1.Event.Definitions, ...SessionEvent.DurableDefinitions, ...SessionAccountingEvent.Definitions].filter(
         (definition) =>
           definition.durable !== undefined &&
           definition !== SessionV1.Event.Created &&
@@ -247,6 +248,27 @@ const layer = Layer.effectDiscard(
       (definition) => events.project(definition, (event) => requireSession(db, event.durable?.aggregateID)),
       { discard: true },
     )
+    yield* events.project(SessionAccountingEvent.Recorded, (event) => {
+      const time_updated = DateTime.toEpochMillis(event.data.timestamp)
+      const update =
+        event.data.cost === undefined || event.data.tokens === undefined
+          ? { time_updated }
+          : {
+              time_updated,
+              cost: sql`${SessionTable.cost} + ${event.data.cost}`,
+              tokens_input: sql`${SessionTable.tokens_input} + ${event.data.tokens.input}`,
+              tokens_output: sql`${SessionTable.tokens_output} + ${event.data.tokens.output}`,
+              tokens_reasoning: sql`${SessionTable.tokens_reasoning} + ${event.data.tokens.reasoning}`,
+              tokens_cache_read: sql`${SessionTable.tokens_cache_read} + ${event.data.tokens.cache.read}`,
+              tokens_cache_write: sql`${SessionTable.tokens_cache_write} + ${event.data.tokens.cache.write}`,
+            }
+      return db
+        .update(SessionTable)
+        .set(update)
+        .where(eq(SessionTable.id, event.data.sessionID))
+        .run()
+        .pipe(Effect.orDie)
+    })
     yield* events.project(SessionV1.Event.Created, (event) =>
       Effect.gen(function* () {
         const stored = yield* db

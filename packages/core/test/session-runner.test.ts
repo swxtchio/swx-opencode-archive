@@ -18,6 +18,7 @@ import { Gemini } from "@opencode-ai/llm/protocols/gemini"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
 import { RequestExecutor } from "@opencode-ai/llm/route"
 import { Database } from "@opencode-ai/core/database/database"
+import { Catalog } from "@opencode-ai/core/catalog"
 import { makeLocationNode } from "@opencode-ai/core/effect/app-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
@@ -53,6 +54,7 @@ import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
+import { ConfigProvider } from "@opencode-ai/core/config/provider"
 import { Tool } from "@opencode-ai/core/tool/tool"
 import {
   SessionContextEpochTable,
@@ -69,7 +71,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { Location } from "@opencode-ai/core/location"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, Stream } from "effect"
-import { asc, eq } from "drizzle-orm"
+import { and, asc, eq } from "drizzle-orm"
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { testEffect } from "./lib/effect"
 
@@ -162,6 +164,17 @@ const projects = Layer.succeed(
 )
 const model = Model.make({ id: "fake-model", provider: "fake", route: OpenAIChat.route })
 const replacementModel = Model.make({ id: "replacement", provider: "fake", route: OpenAIChat.route })
+const catalogModels = new Map<string, ModelV2.Info>()
+const catalogLayer = Layer.mock(Catalog.Service, {
+  model: {
+    get: (providerID, modelID) => Effect.succeed(catalogModels.get(`${providerID}/${modelID}`)),
+  },
+})
+const accountingModel = (id: string, cost: ModelV2.Info["cost"]) =>
+  ModelV2.Info.make({
+    ...ModelV2.Info.empty(ProviderV2.ID.make("fake"), ModelV2.ID.make(id)),
+    cost,
+  })
 const compactModel = Model.make({
   id: "compact",
   provider: "fake",
@@ -292,6 +305,13 @@ const config = Layer.succeed(
               buffer: 3_000,
               keep: new ConfigCompaction.Keep({ tokens: 1_000 }),
             }),
+            providers: {
+              fake: Schema.decodeUnknownSync(ConfigProvider.Info)({
+                models: {
+                  free: { cost: { input: 0, output: 0 } },
+                },
+              }),
+            },
           }),
         }),
         new Config.Directory({ type: "directory", path: AbsolutePath.make(path.join(projectDirectory, ".opencode")) }),
@@ -300,6 +320,7 @@ const config = Layer.succeed(
 )
 const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
   [Snapshot.node, Snapshot.noopLayer],
+  [Catalog.node, catalogLayer],
   [LayerNodePlatform.llmClient, client],
   [SessionRunnerModel.node, models],
   [PluginInternal.node, PluginInternal.readyLayer],
@@ -383,6 +404,7 @@ const it = testEffect(
       ToolRegistry.node,
       ToolRegistry.toolsNode,
       echoNode,
+      Catalog.node,
       SessionRunnerModel.node,
       SystemContextRegistry.node,
       SkillGuidance.node,
@@ -396,6 +418,7 @@ const it = testEffect(
     [
       [LayerNodePlatform.llmClient, client],
       [PermissionV2.node, permission],
+      [Catalog.node, catalogLayer],
       [SessionRunnerModel.node, models],
       [PluginInternal.node, PluginInternal.readyLayer],
       [SystemContextRegistry.node, systemContext],
@@ -647,6 +670,48 @@ const echoTurn = (id: string, text: string) => [
 ]
 
 const textTurn = (id: string, text: string) => fragmentFixture("text", id, [text]).completeEvents
+
+const measuredEvents = (
+  id: string,
+  input: {
+    readonly responseModelID?: string
+    readonly usage?: NonNullable<Parameters<typeof LLMEvent.stepFinish>[0]["usage"]>
+    readonly providerMetadata?: Parameters<typeof LLMEvent.stepFinish>[0]["providerMetadata"]
+  },
+) => {
+  const usage = {
+    index: 0,
+    reason: "stop" as const,
+    ...(input.usage === undefined ? {} : { usage: input.usage }),
+    ...(input.responseModelID === undefined ? {} : { responseModelID: input.responseModelID }),
+    ...(input.providerMetadata === undefined ? {} : { providerMetadata: input.providerMetadata }),
+  }
+  return [
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.textStart({ id }),
+    LLMEvent.textDelta({ id, text: "measured response" }),
+    LLMEvent.textEnd({ id }),
+    LLMEvent.stepFinish(usage),
+    LLMEvent.finish({
+      reason: "stop",
+      ...(input.usage === undefined ? {} : { usage: input.usage }),
+      ...(input.responseModelID === undefined ? {} : { responseModelID: input.responseModelID }),
+      ...(input.providerMetadata === undefined ? {} : { providerMetadata: input.providerMetadata }),
+    }),
+  ]
+}
+
+const accountingRows = (sessionID: SessionV2.ID) =>
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    return yield* db
+      .select()
+      .from(EventTable)
+      .where(and(eq(EventTable.aggregate_id, sessionID), eq(EventTable.type, "session.next.accounting.recorded.1")))
+      .orderBy(asc(EventTable.seq))
+      .all()
+      .pipe(Effect.orDie)
+  })
 
 // Runs one Gemini SSE response through the real Gemini protocol, so tool call IDs come from its parser, which numbers
 // calls by position and restarts at tool_0 in each stream.
@@ -2981,7 +3046,11 @@ describe("SessionRunnerLLM", () => {
       yield* setup
       const session = yield* SessionV2.Service
       response = fragmentFixture("text", "text-earlier", ["Earlier answer"]).completeEvents
-      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Earlier question" }), resume: false })
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Earlier question ".repeat(180) }),
+        resume: false,
+      })
       yield* session.resume(sessionID)
 
       const oversized = `OVERSIZED_BOUNDARY ${"x".repeat(4_500)} OVERSIZED_END`
@@ -5343,6 +5412,323 @@ describe("SessionRunnerLLM", () => {
   )
 })
 
+describe("SessionV2 native accounting", () => {
+  it.effect("records each step once using its reported serving model and preserves absent identity", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      catalogModels.clear()
+      const providerID = ProviderV2.ID.make("fake")
+      catalogModels.set(
+        `${providerID}/fake-model`,
+        accountingModel("fake-model", [
+          { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
+          { tier: { type: "context", size: 500 }, input: 2, output: 8, cache: { read: 0.2, write: 2 } },
+        ]),
+      )
+      catalogModels.set(
+        `${providerID}/served-a`,
+        accountingModel("served-a", [
+          { input: 4, output: 12, cache: { read: 1, write: 4 } },
+          { tier: { type: "context", size: 500 }, input: 6, output: 20, cache: { read: 1.5, write: 5 } },
+        ]),
+      )
+      catalogModels.set(
+        `${providerID}/served-b`,
+        accountingModel("served-b", [{ input: 8, output: 30, cache: { read: 2, write: 6 } }]),
+      )
+      const session = yield* SessionV2.Service
+      const usage = {
+        inputTokens: 1_000,
+        outputTokens: 600,
+        reasoningTokens: 200,
+        cacheReadInputTokens: 100,
+        cacheWriteInputTokens: 50,
+      }
+      const calls = [
+        { prompt: "no serving identity", expected: 0.00662 },
+        { prompt: "requested identity", responseModelID: "fake-model", expected: 0.00662 },
+        { prompt: "served tier pricing", responseModelID: "served-a", expected: 0.0175 },
+        { prompt: "second served member", responseModelID: "served-b", expected: 0.0253 },
+      ]
+      responses = calls.map((item, index) =>
+        measuredEvents(`accounting-${index}`, {
+          usage,
+          ...(item.responseModelID === undefined ? {} : { responseModelID: item.responseModelID }),
+          ...(item.providerMetadata === undefined ? {} : { providerMetadata: item.providerMetadata }),
+        }),
+      )
+
+      yield* Effect.forEach(
+        calls,
+        (item) =>
+          Effect.gen(function* () {
+            yield* session.prompt({ sessionID, prompt: Prompt.make({ text: item.prompt }), resume: false })
+            yield* session.resume(sessionID)
+          }),
+        { concurrency: 1 },
+      )
+
+      const records = yield* accountingRows(sessionID)
+      expect(records).toHaveLength(calls.length)
+      expect(records.map((item) => item.data["responseModelID"])).toEqual([
+        undefined,
+        "fake-model",
+        "served-a",
+        "served-b",
+      ])
+      calls.forEach((call, index) => {
+        const record = records[index]
+        if (!record) throw new Error("provider usage record was not persisted")
+        expect(record.data["cost"]).toBeCloseTo(call.expected, 12)
+      })
+      expect(records[0]?.data["tokens"]).toEqual({
+        input: 850,
+        output: 400,
+        reasoning: 200,
+        cache: { read: 100, write: 50 },
+      })
+      expect((yield* session.get(sessionID)).cost).toBeCloseTo(0.05604, 12)
+      expect((yield* session.get(sessionID)).tokens).toEqual({
+        input: 3_400,
+        output: 1_600,
+        reasoning: 800,
+        cache: { read: 400, write: 200 },
+      })
+    }),
+  )
+
+  it.effect("falls back when a served model is missing or unpriced, but honors configured free and metadata costs", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      catalogModels.clear()
+      const providerID = ProviderV2.ID.make("fake")
+      catalogModels.set(
+        `${providerID}/fake-model`,
+        accountingModel("fake-model", [
+          { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
+          { tier: { type: "context", size: 500 }, input: 2, output: 8, cache: { read: 0.2, write: 2 } },
+        ]),
+      )
+      catalogModels.set(
+        `${providerID}/unpriced`,
+        accountingModel("unpriced", [{ input: 0, output: 0, cache: { read: 0, write: 0 } }]),
+      )
+      catalogModels.set(
+        `${providerID}/free`,
+        accountingModel("free", [{ input: 0, output: 0, cache: { read: 0, write: 0 } }]),
+      )
+      catalogModels.set(
+        `${providerID}/served-a`,
+        accountingModel("served-a", [
+          { input: 4, output: 12, cache: { read: 1, write: 4 } },
+          { tier: { type: "context", size: 500 }, input: 6, output: 20, cache: { read: 1.5, write: 5 } },
+        ]),
+      )
+      const session = yield* SessionV2.Service
+      const usage = {
+        inputTokens: 1_000,
+        outputTokens: 600,
+        reasoningTokens: 200,
+        cacheReadInputTokens: 100,
+        cacheWriteInputTokens: 50,
+      }
+      const calls = [
+        { prompt: "missing served model", responseModelID: "missing", expected: 0.00662 },
+        { prompt: "unpriced served model", responseModelID: "unpriced", expected: 0.00662 },
+        { prompt: "configured free served model", responseModelID: "free", expected: 0 },
+        {
+          prompt: "provider-reported metadata cost",
+          responseModelID: "served-a",
+          providerMetadata: { copilot: { totalNanoAiu: 250_000_000_000 } },
+          expected: 2.5,
+        },
+      ]
+      responses = calls.map((item, index) =>
+        measuredEvents(`accounting-fallback-${index}`, {
+          usage,
+          ...(item.responseModelID === undefined ? {} : { responseModelID: item.responseModelID }),
+          ...(item.providerMetadata === undefined ? {} : { providerMetadata: item.providerMetadata }),
+        }),
+      )
+
+      yield* Effect.forEach(
+        calls,
+        (item) =>
+          Effect.gen(function* () {
+            yield* session.prompt({ sessionID, prompt: Prompt.make({ text: item.prompt }), resume: false })
+            yield* session.resume(sessionID)
+          }),
+        { concurrency: 1 },
+      )
+
+      const records = yield* accountingRows(sessionID)
+      expect(records).toHaveLength(calls.length)
+      calls.forEach((call, index) => {
+        const record = records[index]
+        if (!record) throw new Error("provider usage record was not persisted")
+        expect(record.data["cost"]).toBeCloseTo(call.expected, 12)
+      })
+      expect((yield* session.get(sessionID)).cost).toBeCloseTo(2.51324, 12)
+    }),
+  )
+
+  it.effect("retains measured usage when the provider fails after step-finish", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      catalogModels.clear()
+      const providerID = ProviderV2.ID.make("fake")
+      catalogModels.set(
+        `${providerID}/fake-model`,
+        accountingModel("fake-model", [{ input: 3, output: 15, cache: { read: 0, write: 0 } }]),
+      )
+      const session = yield* SessionV2.Service
+      const usage = { inputTokens: 1_000_000, outputTokens: 0 }
+      responseStream = Stream.concat(
+        Stream.fromIterable([LLMEvent.stepFinish({ index: 0, reason: "stop", usage })]),
+        Stream.fail(providerUnavailable()),
+      )
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Fail after measured usage" }), resume: false })
+      const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(yield* accountingRows(sessionID)).toMatchObject([
+        { data: { operation: "turn", cost: 3, tokens: { input: 1_000_000, output: 0 } } },
+      ])
+      expect((yield* session.get(sessionID)).cost).toBe(3)
+      expect((yield* session.wait(sessionID)).type).toBe("failed")
+    }),
+  )
+
+  it.effect("retains measured usage when a later local tool settlement fails", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      catalogModels.clear()
+      const providerID = ProviderV2.ID.make("fake")
+      catalogModels.set(
+        `${providerID}/fake-model`,
+        accountingModel("fake-model", [{ input: 3, output: 15, cache: { read: 0, write: 0 } }]),
+      )
+      const session = yield* SessionV2.Service
+      const usage = { inputTokens: 1_000_000, outputTokens: 0 }
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-accounting-defect", name: "defect", input: {} }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage, responseModelID: "fake-model" }),
+          LLMEvent.finish({ reason: "tool-calls", usage, responseModelID: "fake-model" }),
+        ],
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id: "text-accounting-defect-recovery" }),
+          LLMEvent.textDelta({ id: "text-accounting-defect-recovery", text: "Recovered" }),
+          LLMEvent.textEnd({ id: "text-accounting-defect-recovery" }),
+          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+          LLMEvent.finish({ reason: "stop" }),
+        ],
+      ]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Call a failing tool" }), resume: false })
+      yield* session.resume(sessionID)
+
+      expect(requests).toHaveLength(2)
+      expect(yield* accountingRows(sessionID)).toMatchObject([
+        { data: { operation: "turn", cost: 3, responseModelID: "fake-model" } },
+      ])
+      expect((yield* session.get(sessionID)).cost).toBe(3)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Call a failing tool" },
+        {
+          type: "assistant",
+          content: [
+            {
+              type: "tool",
+              id: "call-accounting-defect",
+              state: { status: "error", error: { message: "Tool execution failed: unexpected tool defect" } },
+            },
+          ],
+        },
+        { type: "assistant", finish: "stop", content: [{ type: "text", text: "Recovered" }] },
+      ])
+    }),
+  )
+
+  it.effect("retains measured usage when interrupted after step-finish", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      catalogModels.clear()
+      const providerID = ProviderV2.ID.make("fake")
+      catalogModels.set(
+        `${providerID}/fake-model`,
+        accountingModel("fake-model", [{ input: 3, output: 15, cache: { read: 0, write: 0 } }]),
+      )
+      const session = yield* SessionV2.Service
+      const seen = yield* Deferred.make<void>()
+      const gate = yield* Deferred.make<void>()
+      const joined = yield* Deferred.make<void>()
+      const outcome = yield* Deferred.make<Exit.Exit<SessionV2.WaitResult, SessionV2.Error>>()
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          joinAck = undefined
+          responseStream = undefined
+        }).pipe(Effect.andThen(Deferred.succeed(gate, undefined)), Effect.asVoid),
+      )
+      const usage = { inputTokens: 1_000_000, outputTokens: 0 }
+      responseStream = Stream.concat(
+        Stream.make(LLMEvent.stepFinish({ index: 0, reason: "stop", usage })),
+        Stream.fromEffect(
+          Deferred.succeed(seen, undefined).pipe(
+            Effect.andThen(Deferred.await(gate)),
+            Effect.as(LLMEvent.finish({ reason: "stop", usage })),
+          ),
+        ),
+      )
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Interrupt after measured usage" }), resume: false })
+      const drain = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* awaitSignal(seen, "provider stream did not reach the post-measurement gate")
+      expect(yield* Deferred.isDone(gate)).toBe(false)
+      expect((yield* session.active).has(sessionID)).toBe(true)
+      joinAck = joined
+      const waiter = yield* session.wait(sessionID).pipe(
+        Effect.exit,
+        Effect.flatMap((exit) => Deferred.succeed(outcome, exit)),
+        Effect.forkChild,
+      )
+      yield* awaitSignal(joined, "wait did not join the interrupted drain")
+      yield* session.interrupt(sessionID)
+      const exit = yield* Fiber.await(drain)
+      expect(yield* Deferred.await(outcome)).toMatchObject({
+        _tag: "Success",
+        value: { type: "interrupted" },
+      })
+
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(yield* accountingRows(sessionID)).toMatchObject([
+        { data: { operation: "turn", cost: 3, tokens: { input: 1_000_000, output: 0 } } },
+      ])
+      expect((yield* session.get(sessionID)).cost).toBe(3)
+      const eventTypes = (yield* session.history({ sessionID, limit: 100 })).events.map((event) => event.type)
+      expect(eventTypes).toContain(SessionEvent.Step.Failed.type)
+      expect(eventTypes).not.toContain(SessionEvent.Step.Ended.type)
+      expect((yield* session.wait(sessionID)).type).toBe("interrupted")
+      yield* Fiber.join(waiter)
+    }),
+  )
+
+  it.effect("does not invent usage when a provider fails without a measurement", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      streamFailure = providerUnavailable()
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "No usage control" }), resume: false })
+      const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(yield* accountingRows(sessionID)).toEqual([])
+      expect((yield* session.get(sessionID)).cost).toBe(0)
+      expect((yield* session.wait(sessionID)).type).toBe("failed")
+    }),
+  )
+})
+
 describe("SessionV2 auxiliary model work", () => {
   const titleSystem = "Title instructions"
   const isTitleRequest = (request: LLMRequest) => request.system.some((part) => part.text === titleSystem)
@@ -5382,6 +5768,66 @@ describe("SessionV2 auxiliary model work", () => {
       )
       expect((yield* session.get(sessionID)).title).toBe("Fixing the build")
       expect(yield* durableTypes).toContain("session.next.titled")
+    }),
+  )
+
+  it.effect("accounts title and primary requests separately when both report served models", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      catalogModels.clear()
+      catalogModels.set(
+        "fake/small",
+        accountingModel("small", [{ input: 1, output: 2, cache: { read: 0, write: 0 } }]),
+      )
+      catalogModels.set(
+        "fake/fake-model",
+        accountingModel("fake-model", [{ input: 3, output: 15, cache: { read: 0, write: 0 } }]),
+      )
+      catalogModels.set(
+        "fake/title-served",
+        accountingModel("title-served", [{ input: 4, output: 8, cache: { read: 0, write: 0 } }]),
+      )
+      catalogModels.set(
+        "fake/main-served",
+        accountingModel("main-served", [{ input: 6, output: 20, cache: { read: 0, write: 0 } }]),
+      )
+      yield* addTitleAgent
+      yield* addPrimarySmallModel
+      const session = yield* SessionV2.Service
+      const usage = { inputTokens: 100, outputTokens: 40 }
+      responses = [
+        measuredEvents("title-measured", { usage, responseModelID: "title-served" }),
+        measuredEvents("main-measured", { usage, responseModelID: "main-served" }),
+      ]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Question to title and answer" }), resume: false })
+      yield* session.resume(sessionID)
+
+      const titleRequest = requests.find(isTitleRequest)
+      const mainRequest = requests.find((request) => !isTitleRequest(request))
+      const records = yield* accountingRows(sessionID)
+      const titleRecord = records.find((record) => record.data["operation"] === "title")
+      const mainRecord = records.find((record) => record.data["operation"] === "turn")
+      if (!titleRequest || !mainRequest || !titleRecord || !mainRecord) {
+        throw new Error("title and primary usage records were not persisted")
+      }
+      expect(records).toHaveLength(2)
+      expect(titleRecord.data["requestedModel"]).toMatchObject({ id: "small", providerID: "fake" })
+      expect(mainRecord.data["requestedModel"]).toMatchObject({ id: "fake-model", providerID: "fake" })
+      expect(titleRecord.data["responseModelID"]).toBe(
+        requests.indexOf(titleRequest) === 0 ? "title-served" : "main-served",
+      )
+      expect(mainRecord.data["responseModelID"]).toBe(
+        requests.indexOf(mainRequest) === 0 ? "title-served" : "main-served",
+      )
+      expect(titleRecord.data["cost"]).toBeCloseTo(
+        titleRecord.data["responseModelID"] === "title-served" ? 0.00072 : 0.0014,
+        12,
+      )
+      expect(mainRecord.data["cost"]).toBeCloseTo(
+        mainRecord.data["responseModelID"] === "main-served" ? 0.0014 : 0.00072,
+        12,
+      )
+      expect((yield* session.get(sessionID)).cost).toBeCloseTo(0.00212, 12)
     }),
   )
 
@@ -5522,6 +5968,145 @@ describe("SessionV2 auxiliary model work", () => {
     }),
   )
 
+  it.effect("records manual compaction usage from its reported serving model", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      catalogModels.clear()
+      catalogModels.set("fake/small", accountingModel("small", [{ input: 1, output: 2, cache: { read: 0, write: 0 } }]))
+      catalogModels.set(
+        "fake/manual-served",
+        accountingModel("manual-served", [{ input: 4, output: 8, cache: { read: 0, write: 0 } }]),
+      )
+      yield* addPrimarySmallModel
+      const session = yield* SessionV2.Service
+      response = textTurn("accounting-manual-seed", "An earlier answer")
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "An earlier question" }), resume: false })
+      yield* session.resume(sessionID)
+
+      response = measuredEvents("accounting-manual-summary", {
+        usage: { inputTokens: 100, outputTokens: 40 },
+        responseModelID: "manual-served",
+      })
+      yield* session.compact({ sessionID })
+
+      const records = (yield* accountingRows(sessionID)).filter((record) => record.data["operation"] === "compaction")
+      expect(records).toHaveLength(1)
+      expect(records[0]?.data["responseModelID"]).toBe("manual-served")
+      expect(records[0]?.data["cost"]).toBeCloseTo(0.00072, 12)
+      expect((yield* session.get(sessionID)).cost).toBeCloseTo(0.00072, 12)
+    }),
+  )
+
+  it.effect("records automatic compaction usage from its reported serving model", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      catalogModels.clear()
+      catalogModels.set("fake/small", accountingModel("small", [{ input: 1, output: 2, cache: { read: 0, write: 0 } }]))
+      catalogModels.set(
+        "fake/automatic-served",
+        accountingModel("automatic-served", [{ input: 6, output: 12, cache: { read: 0, write: 0 } }]),
+      )
+      yield* addPrimarySmallModel
+      const session = yield* SessionV2.Service
+      response = textTurn("accounting-automatic-seed", "Earlier answer")
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Earlier question ".repeat(180) }),
+        resume: false,
+      })
+      yield* session.resume(sessionID)
+
+      currentModel = compactModel
+      responses = [
+        measuredEvents("accounting-automatic-summary", {
+          usage: { inputTokens: 100, outputTokens: 40 },
+          responseModelID: "automatic-served",
+        }),
+        textTurn("accounting-automatic-final", "Continued after automatic compaction"),
+      ]
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Recent exact request ".repeat(180) }),
+        resume: false,
+      })
+      yield* session.resume(sessionID)
+
+      const records = (yield* accountingRows(sessionID)).filter((record) => record.data["operation"] === "compaction")
+      expect(records).toHaveLength(1)
+      expect(records[0]?.data["responseModelID"]).toBe("automatic-served")
+      expect(records[0]?.data["cost"]).toBeCloseTo(0.00108, 12)
+      expect((yield* session.get(sessionID)).cost).toBeCloseTo(0.00108, 12)
+    }),
+  )
+
+  it.effect("records overflow-triggered compaction usage from its reported serving model", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      catalogModels.clear()
+      catalogModels.set("fake/small", accountingModel("small", [{ input: 1, output: 2, cache: { read: 0, write: 0 } }]))
+      catalogModels.set(
+        "fake/overflow-served",
+        accountingModel("overflow-served", [{ input: 10, output: 20, cache: { read: 0, write: 0 } }]),
+      )
+      yield* addPrimarySmallModel
+      const session = yield* SessionV2.Service
+      currentModel = recoveryModel
+      response = textTurn("accounting-overflow-seed", "Earlier answer")
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Earlier question ".repeat(500) }),
+        resume: false,
+      })
+      yield* session.resume(sessionID)
+
+      responses = [
+        [LLMEvent.providerError({ message: "prompt too long", classification: "context-overflow" })],
+        measuredEvents("accounting-overflow-summary", {
+          usage: { inputTokens: 100, outputTokens: 40 },
+          responseModelID: "overflow-served",
+        }),
+        textTurn("accounting-overflow-final", "Continued after overflow compaction"),
+      ]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Trigger overflow recovery" }), resume: false })
+      yield* session.resume(sessionID)
+
+      const records = (yield* accountingRows(sessionID)).filter((record) => record.data["operation"] === "compaction")
+      expect(records).toHaveLength(1)
+      expect(records[0]?.data["responseModelID"]).toBe("overflow-served")
+      expect(records[0]?.data["cost"]).toBeCloseTo(0.0018, 12)
+      expect((yield* session.get(sessionID)).cost).toBeCloseTo(0.0018, 12)
+    }),
+  )
+
+  it.effect("retains usage from an unsuccessful compaction request", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      catalogModels.clear()
+      catalogModels.set("fake/small", accountingModel("small", [{ input: 1, output: 2, cache: { read: 0, write: 0 } }]))
+      catalogModels.set(
+        "fake/failed-served",
+        accountingModel("failed-served", [{ input: 12, output: 30, cache: { read: 0, write: 0 } }]),
+      )
+      yield* addPrimarySmallModel
+      const session = yield* SessionV2.Service
+      response = textTurn("accounting-failed-compaction-seed", "Earlier answer")
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Earlier question" }), resume: false })
+      yield* session.resume(sessionID)
+
+      const usage = { inputTokens: 100, outputTokens: 40 }
+      responseStream = Stream.concat(
+        Stream.make(LLMEvent.stepFinish({ index: 0, reason: "stop", usage, responseModelID: "failed-served" })),
+        Stream.fail(providerUnavailable()),
+      )
+      const failed = yield* session.compact({ sessionID }).pipe(Effect.flip)
+
+      expect(failed).toMatchObject({ _tag: "Session.CompactionFailedError", sessionID })
+      const records = (yield* accountingRows(sessionID)).filter((record) => record.data["operation"] === "compaction")
+      expect(records).toMatchObject([{ data: { cost: 0.0024, responseModelID: "failed-served" } }])
+      expect((yield* session.get(sessionID)).cost).toBeCloseTo(0.0024, 12)
+    }),
+  )
+
   it.effect("completes a manual compaction with nothing to compact without asking a model", () =>
     Effect.gen(function* () {
       yield* setupNative
@@ -5530,6 +6115,7 @@ describe("SessionV2 auxiliary model work", () => {
       yield* session.compact({ sessionID })
 
       expect(requests).toHaveLength(0)
+      expect(yield* accountingRows(sessionID)).toEqual([])
       expect(yield* session.context(sessionID)).toEqual([])
     }),
   )
